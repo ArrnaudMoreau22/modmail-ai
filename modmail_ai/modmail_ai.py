@@ -25,10 +25,10 @@ from core import checks
 from core.models import PermissionLevel
 
 try:
-    import httpx
-    HAS_HTTPX = True
+    import aiohttp
+    HAS_AIOHTTP = True
 except ImportError:
-    HAS_HTTPX = False
+    HAS_AIOHTTP = False
 
 # Clés de configuration stockées dans le plugin DB
 _KEY_URL = "backend_url"
@@ -223,8 +223,8 @@ class ModMailAI(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
         self.db = bot.plugin_db.get_partition(self)
-        if not HAS_HTTPX:
-            print("[ModMailAI] AVERTISSEMENT : httpx non installé (pip install httpx).")
+        if not HAS_AIOHTTP:
+            print("[ModMailAI] AVERTISSEMENT : aiohttp non disponible (normalement inclus avec discord.py).")
 
     # ── Accès config DB ───────────────────────────────────────────────────────
 
@@ -318,8 +318,8 @@ class ModMailAI(commands.Cog):
             inline=True,
         )
         embed.add_field(
-            name="httpx",
-            value="✅ Disponible" if HAS_HTTPX else "❌ Non installé (`pip install httpx`)",
+            name="aiohttp",
+            value="✅ Disponible" if HAS_AIOHTTP else "❌ Non disponible (erreur d'environnement)",
             inline=True,
         )
         if not backend_url or not has_token:
@@ -363,13 +363,14 @@ class ModMailAI(commands.Cog):
         - Aucune sanction exécutée.
         - Aucune commande UnbelievaBoat.
         """
-        if not HAS_HTTPX:
+        if not HAS_AIOHTTP:
             await ctx.send(
                 embed=discord.Embed(
-                    title="❌ Module manquant",
+                    title="❌ aiohttp indisponible",
                     description=(
-                        "Le module `httpx` n'est pas installé sur ce bot.\n"
-                        "Contacter l'administrateur du bot pour installer : `pip install httpx`"
+                        "`aiohttp` n'est pas accessible dans cet environnement.\n"
+                        "Ce module est normalement inclus avec discord.py — "
+                        "contacter l'administrateur du bot."
                     ),
                     color=COLOR_DANGER,
                 )
@@ -436,15 +437,14 @@ class ModMailAI(commands.Cog):
                 guild_id=guild_id,
                 thread_id=thread_id,
             )
-        except httpx.HTTPStatusError as e:
-            status = e.response.status_code
-            if status in (401, 403):
+        except aiohttp.ClientResponseError as e:
+            if e.status in (401, 403):
                 desc = (
                     "Le backend a refusé la requête (token invalide ou expiré).\n"
                     "Un administrateur doit reconfigurer le token avec `?aisettoken`."
                 )
             else:
-                desc = f"Le backend a retourné une erreur HTTP {status}."
+                desc = f"Le backend a retourné une erreur HTTP {e.status}."
             await loading_msg.edit(
                 embed=discord.Embed(title="❌ Erreur backend", description=desc, color=COLOR_DANGER)
             )
@@ -546,23 +546,24 @@ class ModMailAI(commands.Cog):
         thread_id: str,
     ) -> dict:
         """
-        Appelle le backend IA.
+        Appelle le backend IA via aiohttp (inclus avec discord.py, aucun pip install requis).
         Le token n'est jamais loggé. Envoyé uniquement dans le header Authorization.
         """
         headers = {
             "Authorization": f"Bearer {backend_token}",
-            "Content-Type": "application/json",
             "X-Discord-Guild-ID": guild_id,
             "X-ModMail-Thread-ID": thread_id,
         }
-        async with httpx.AsyncClient(timeout=60) as client:
-            resp = await client.post(
+        timeout = aiohttp.ClientTimeout(total=60)
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
                 f"{backend_url}/api/review-ticket",
                 json=payload,
                 headers=headers,
-            )
-            resp.raise_for_status()
-            return resp.json()
+                timeout=timeout,
+            ) as response:
+                response.raise_for_status()
+                return await response.json()
 
     # ── Listener automatique (désactivé par défaut) ───────────────────────────
 
