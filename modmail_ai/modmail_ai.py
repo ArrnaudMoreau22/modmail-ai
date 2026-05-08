@@ -44,7 +44,168 @@ COLOR_SUCCESS = discord.Color.green()
 COLOR_NEUTRAL = discord.Color.greyple()
 
 
-# ── Helpers embeds ────────────────────────────────────────────────────────────
+# ── Constantes filtrage/extraction ────────────────────────────────────────────
+
+# Commandes staff à toujours exclure du contexte ticket (jamais envoyées au LLM)
+_STAFF_CMD_PREFIXES = (
+    "?aireview", "?aiseturl", "?aisettoken", "?aistatus", "?aireset", "?plugin",
+)
+
+# Fragments de titres des embeds générés par ce plugin (à exclure du contexte)
+_AI_EMBED_TITLE_FRAGMENTS = (
+    "Analyse IA",
+    "Réponse proposée",
+    "Action staff recommandée",
+    "Analyse en cours",
+)
+
+# Mots-clés de noms de champs identifiant l'embed info initial de ModMail
+# (contient les infos compte : rôles, création, anciens tickets…)
+_MODMAIL_INFO_FIELD_KEYWORDS = (
+    "account created", "account creation",
+    "joined", "roles", "rôles",
+    "previous threads", "previous modmail",
+    "anciens tickets",
+)
+
+
+# ── Helpers filtrage ──────────────────────────────────────────────────────────
+
+def _is_ai_plugin_embed(message) -> bool:
+    """True si le message contient un embed généré par ce plugin IA."""
+    for embed in message.embeds:
+        if embed.title and any(frag in embed.title for frag in _AI_EMBED_TITLE_FRAGMENTS):
+            return True
+    return False
+
+
+def _get_staff_command_reason(content: str, is_direct_mod: bool) -> str | None:
+    """
+    Retourne une raison d'exclusion si le message est une commande staff.
+    None si le message est du contenu normal.
+    """
+    if not content:
+        return None
+    stripped = content.strip()
+    for prefix in _STAFF_CMD_PREFIXES:
+        if stripped.lower().startswith(prefix.lower()):
+            return f"staff_cmd:{prefix}"
+    if is_direct_mod and stripped.startswith("?"):
+        return "staff_cmd:? (mod)"
+    if is_direct_mod and stripped.startswith("!"):
+        return "staff_cmd:! (mod/unbelievaboat)"
+    return None
+
+
+def _author_is_staff(message) -> bool:
+    """True si l'auteur du message a des permissions staff dans le serveur."""
+    perms = getattr(message.author, "guild_permissions", None)
+    if perms is None:
+        return False
+    return perms.manage_messages or perms.manage_guild or perms.administrator
+
+
+# ── Helpers extraction embed ModMail ─────────────────────────────────────────
+
+def _is_modmail_info_embed(embed) -> bool:
+    """
+    True si l'embed est l'embed info initial de création de thread ModMail.
+    Détecte les champs système : Roles, Account Created, Previous Threads, etc.
+    """
+    for field in embed.fields:
+        field_lower = (field.name or "").lower()
+        if any(kw in field_lower for kw in _MODMAIL_INFO_FIELD_KEYWORDS):
+            return True
+    footer_text = (embed.footer.text if embed.footer else "") or ""
+    if "user id" in footer_text.lower():
+        return True
+    return False
+
+
+def _extract_initial_user_message(message, thread_id: str, recipient) -> dict | None:
+    """
+    Extrait le premier message du joueur depuis l'embed info initial de ModMail.
+    ModMail place le premier DM du joueur dans la description de cet embed.
+
+    Retourne un dict message compatible avec le backend, ou None si rien à extraire.
+    """
+    for embed in message.embeds:
+        if not _is_modmail_info_embed(embed):
+            continue
+
+        # Description = premier message du joueur (cas le plus courant)
+        first_content = (embed.description or "").strip()
+
+        # Certaines versions le placent dans un champ "Message"
+        if not first_content:
+            for field in embed.fields:
+                if "message" in (field.name or "").lower():
+                    first_content = (field.value or "").strip()
+                    break
+
+        if not first_content:
+            return None
+
+        # Extraire l'ID utilisateur depuis le footer "User ID: 123456789"
+        user_id = ""
+        footer_text = (embed.footer.text if embed.footer else "") or ""
+        if "user id" in footer_text.lower():
+            for token in footer_text.split():
+                if token.isdigit() and len(token) > 14:
+                    user_id = token
+                    break
+        if not user_id and recipient:
+            user_id = str(recipient.id)
+
+        # Nom affiché depuis l'auteur de l'embed ou le recipient
+        user_name = ""
+        if embed.author and embed.author.name:
+            user_name = embed.author.name
+        if not user_name and recipient:
+            user_name = str(recipient)
+
+        return {
+            "id": f"initial-embed-{thread_id}",
+            "content": first_content,
+            "author_id": user_id,
+            "author_display_name": user_name,
+            "timestamp": message.created_at.isoformat(),
+            "is_mod": False,
+            "is_official_reply": False,
+            "internal": False,
+            "author_role": "user",
+            "source": "live_modmail_embed",
+            "attachments": [],
+            "embeds": [],
+        }
+
+    return None
+
+
+def _build_message_content(message) -> str:
+    """
+    Combine message.content et les descriptions d'embeds en un texte unique.
+    Les embeds info ModMail (système) sont exclus car traités séparément.
+    """
+    parts = []
+    if message.content:
+        parts.append(message.content)
+    for embed in message.embeds:
+        if _is_modmail_info_embed(embed):
+            continue
+        desc = (embed.description or "").strip()
+        if desc:
+            parts.append(desc)
+        for field in embed.fields:
+            val = (field.value or "").strip()
+            if val:
+                parts.append(f"{field.name}: {val}" if field.name else val)
+        if embed.footer and embed.footer.text:
+            parts.append(embed.footer.text)
+    return "\n".join(filter(None, parts))
+
+
+# ── Helpers embeds résultats ─────────────────────────────────────────────────
 
 def _trunc(text: str, limit: int = 1024) -> str:
     if not text:
@@ -272,11 +433,10 @@ class ModMailAI(commands.Cog):
         Configure le token d'authentification backend.
         Le message Discord est supprimé immédiatement pour protéger le token.
         """
-        # Supprimer immédiatement le message pour ne jamais exposer le token
         try:
             await ctx.message.delete()
         except (discord.Forbidden, discord.HTTPException):
-            pass  # Pas de permission de suppression — on continue quand même
+            pass
 
         if not token.strip():
             await ctx.send(
@@ -290,7 +450,6 @@ class ModMailAI(commands.Cog):
 
         await self._set_config(_KEY_TOKEN, token.strip())
 
-        # Réponse générique — ne jamais répéter le token
         await ctx.send(
             embed=discord.Embed(
                 title="✅ Token configuré",
@@ -476,65 +635,114 @@ class ModMailAI(commands.Cog):
     # ── Helpers privés ────────────────────────────────────────────────────────
 
     async def _build_payload(self, thread, ctx) -> dict:
-        """Collecte et normalise le contexte du thread ModMail."""
+        """
+        Collecte et normalise le contexte du thread ModMail pour le backend.
+
+        Filtres appliqués :
+        1. Embeds générés par ce plugin IA (Analyse IA, Réponse proposée…).
+        2. Commandes staff (?aireview, ?aisettoken, !warn…).
+        3. Embed info initial ModMail → premier message joueur extrait séparément.
+
+        Le premier message joueur (issu de l'embed initial) est injecté en tête
+        du payload avec source="live_modmail_embed" pour que le LLM le voie.
+        """
         recipient = thread.recipient
+        bot_user = self.bot.user
+        mod_color_value = self.bot.config.get("mod_color")
+        thread_id = str(thread.id)
 
         messages = []
+        initial_embed_processed = False
+        excluded: list[tuple[str, str]] = []
+
         async for message in ctx.channel.history(limit=50, oldest_first=True):
+            msg_id = str(message.id)
+
+            # Filtre 1 : embeds générés par ce plugin IA
+            if _is_ai_plugin_embed(message):
+                excluded.append((msg_id, "ai_plugin_embed"))
+                continue
+
+            # Déterminer si l'auteur direct (non-bot) est un mod
+            is_direct_mod = message.author != bot_user and _author_is_staff(message)
+
+            # Filtre 2 : commandes staff (contenu)
+            cmd_reason = _get_staff_command_reason(message.content or "", is_direct_mod)
+            if cmd_reason:
+                excluded.append((msg_id, cmd_reason))
+                continue
+
+            # Filtre 3 : embed info initial ModMail → extraire le premier message joueur
+            if message.author == bot_user and not initial_embed_processed:
+                initial_msg = _extract_initial_user_message(message, thread_id, recipient)
+                if initial_msg is not None:
+                    messages.append(initial_msg)
+                    initial_embed_processed = True
+                    excluded.append((msg_id, "modmail_info_embed_extracted"))
+                    continue
+
+            # Message normal : déterminer rôle et contenu
             is_mod = False
             is_official_reply = False
-            is_internal = False
-
-            if message.author == self.bot.user:
-                mod_color = self.bot.config.get("mod_color")
+            if message.author == bot_user:
+                # Message du bot : réponse staff forwarded si couleur = mod_color
                 for embed in message.embeds:
-                    if mod_color and embed.color and embed.color.value == mod_color:
+                    if mod_color_value and embed.color and embed.color.value == mod_color_value:
                         is_mod = True
                         is_official_reply = True
+                        break
+            else:
+                is_mod = is_direct_mod
 
-            messages.append(
-                {
-                    "id": str(message.id),
-                    "content": message.content or "",
-                    "author_id": str(message.author.id),
-                    "author_display_name": message.author.display_name,
-                    "timestamp": message.created_at.isoformat(),
-                    "is_mod": is_mod,
-                    "is_official_reply": is_official_reply,
-                    "internal": is_internal,
-                    "author_role": "staff" if is_mod else "user",
-                    "attachments": [
-                        {
-                            "id": str(att.id),
-                            "url": att.url,
-                            "filename": att.filename,
-                            "content_type": getattr(att, "content_type", None),
-                        }
-                        for att in message.attachments
-                    ],
-                    "embeds": [
-                        {
-                            "title": emb.title,
-                            "description": emb.description,
-                            "color": emb.color.value if emb.color else None,
-                            "fields": [
-                                {"name": f.name, "value": f.value} for f in emb.fields
-                            ],
-                        }
-                        for emb in message.embeds
-                    ],
-                }
-            )
+            content = _build_message_content(message)
+            if not content and not message.attachments:
+                excluded.append((msg_id, "empty_content"))
+                continue
+
+            messages.append({
+                "id": msg_id,
+                "content": content,
+                "author_id": str(message.author.id),
+                "author_display_name": message.author.display_name,
+                "timestamp": message.created_at.isoformat(),
+                "is_mod": is_mod,
+                "is_official_reply": is_official_reply,
+                "internal": False,
+                "author_role": "staff" if is_mod else "user",
+                "source": "live_modmail",
+                "attachments": [
+                    {
+                        "id": str(att.id),
+                        "url": att.url,
+                        "filename": att.filename,
+                        "content_type": getattr(att, "content_type", None),
+                    }
+                    for att in message.attachments
+                ],
+                "embeds": [
+                    {
+                        "title": emb.title,
+                        "description": emb.description,
+                        "color": emb.color.value if emb.color else None,
+                        "fields": [{"name": f.name, "value": f.value} for f in emb.fields],
+                        "footer": emb.footer.text if emb.footer else None,
+                    }
+                    for emb in message.embeds
+                ],
+            })
 
         return {
-            "thread_id": str(thread.id),
+            "thread_id": thread_id,
             "channel_id": str(ctx.channel.id),
             "guild_id": str(ctx.guild.id) if ctx.guild else "",
             "recipient_user_id": str(recipient.id) if recipient else None,
             "recipient_display_name": str(recipient) if recipient else None,
             "messages": messages,
             "attachments": [],
-            "options": {"requested_by": str(ctx.author.id)},
+            "options": {
+                "requested_by": str(ctx.author.id),
+                "excluded_count": len(excluded),
+            },
         }
 
     async def _call_backend(
